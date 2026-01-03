@@ -10,7 +10,7 @@ const server = net.createServer((socket) => {
   
   // 发送欢迎消息
   socket.write('Welcome to the LAN Chat Server!\n');
-  socket.write('Enter your username: ');
+  socket.write('Enjoy your Chatting! ');
   
   let username = `User${clients.length}`;
   let gotUsername = false;

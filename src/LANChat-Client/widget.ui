@@ -134,9 +134,38 @@
            </widget>
           </item>
           <item>
+           <widget class="QPushButton" name="uploadButton">
+            <property name="text">
+             <string>上传文件</string>
+            </property>
+            <!--<property name="icon">
+             <iconset>
+              <normaloff>:/icons/upload.png</normaloff>:/icons/upload.png</iconset>
+            </property>-->
+           </widget>
+          </item>
+          <item>
            <widget class="QPushButton" name="sendButton">
             <property name="text">
              <string>发送</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="horizontalLayout_6">
+          <item>
+           <widget class="QProgressBar" name="uploadProgressBar">
+            <property name="value">
+             <number>0</number>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="uploadStatusLabel">
+            <property name="text">
+             <string>就绪</string>
             </property>
            </widget>
           </item>

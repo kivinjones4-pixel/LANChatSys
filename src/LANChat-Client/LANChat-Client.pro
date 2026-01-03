@@ -1,18 +1,21 @@
-# p2pChat-Client.pro
+# LANChat-Client.pro
 QT       += core gui
-QT       += network        # 添加网络模块
+QT       += network        # 网络模块
 QT       += widgets
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 CONFIG += c++17
-# 你可以在这里添加你的源文件
+
+# 添加资源文件（用于图标）
+# RESOURCES += resources.qrc
+
 SOURCES += \
     main.cpp \
-    widget.cpp \
+    widget.cpp
 
 HEADERS += \
-    widget.h \
+    widget.h
 
 FORMS += \
     widget.ui
@@ -35,9 +38,16 @@ QMAKE_CXXFLAGS += -std=c++17 -Wall -Wextra
 TARGET = LANChat-Client
 TEMPLATE = app
 
-# 图标（可选）
-# RC_ICONS = resources/icon.ico
+# Windows特定设置
+win32 {
+    # RC_ICONS = resources/icon.ico
+    LIBS += -lws2_32
+}
 
-# 安装路径（可选）
-target.path = $$[QT_INSTALL_BINS]
-INSTALLS += target
+# Linux特定设置
+unix:!macx {
+    QMAKE_LFLAGS += -no-pie
+}
+
+# 不要添加这个，因为它会干扰Qt的包含路径
+# INCLUDEPATH += $$PWD
