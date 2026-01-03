@@ -1,0 +1,26 @@
+{
+  "name": "lanchat-server",
+  "version": "1.0.0",
+  "description": "点对点聊天服务器 - Node.js/TypeScript实现",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "dev:watch": "ts-node-dev --respawn src/index.ts",
+    "test": "jest",
+    "docker:build": "docker build -t p2pchat-server .",
+    "docker:run": "docker run -p 8888:8888 p2pchat-server"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^9.4.0",
+    "winston": "^3.8.2"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "typescript": "^5.0.0",
+    "ts-node-dev": "^2.0.0",
+    "@types/commander": "^2.12.2"
+  }
+}
