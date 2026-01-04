@@ -27,6 +27,7 @@
 #include <QMimeDatabase>
 #include <cmath>
 
+// 在构造函数中安装事件过滤器
 Widget::Widget(QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::Widget)
@@ -38,21 +39,112 @@ Widget::Widget(QWidget *parent)
     , serverPort(8888)
     , totalFileSize(0)
     , currentUpload(nullptr)
+    , isHandlingDownload(false)
 {
     ui->setupUi(this);
 
-    // 设置窗口标题和图标
     setWindowTitle("LAN 聊天客户端 - 文件传输支持");
-    // setWindowIcon(QIcon(":/icons/chat.png"));  // 如果有资源文件的话
 
-    // 初始化
     setupUI();
     setupConnections();
+    setupTextBrowserConnections();
     setupDefaultValues();
     loadSettings();
 
-    // 尝试自动连接
+    ui->chatText->installEventFilter(this);
+
+    // 定期清理 QTextBrowser 状态
+    QTimer *cleanTimer = new QTimer(this);
+    connect(cleanTimer, &QTimer::timeout, this, &Widget::cleanTextBrowser);
+    cleanTimer->start(5000);  // 每5秒清理一次
+
     QTimer::singleShot(100, this, &Widget::startAutoConnect);
+}
+
+// 事件过滤器实现
+bool Widget::eventFilter(QObject *obj, QEvent *event)
+{
+    if (obj == ui->chatText && event->type() == QEvent::KeyPress) {
+        // 如果正在处理下载，忽略某些按键事件
+        if (isHandlingDownload) {
+            return true; // 阻止事件传播
+        }
+    }
+    return QWidget::eventFilter(obj, event);
+}
+
+void Widget::setupTextBrowserConnections()
+{
+    // 连接QTextBrowser的锚点点击信号
+    connect(ui->chatText, &QTextBrowser::anchorClicked, this, &Widget::handleDownloadRequest);
+
+    // 额外连接：捕获QTextBrowser的链接激活信号（如果有的话）
+    connect(ui->chatText, &QTextBrowser::anchorClicked, this, [this](const QUrl &url) {
+        // 阻止所有默认行为
+        ui->chatText->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+        // 手动处理链接
+        handleDownloadRequest(url);
+    });
+}
+void Widget::cleanTextBrowser()
+{
+    // 清理 QTextBrowser 的缓存和状态
+    ui->chatText->clearFocus();
+    ui->chatText->document()->clearUndoRedoStacks();
+    ui->chatText->document()->setModified(false);
+
+    // 重新设置文本交互标志
+    ui->chatText->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::LinksAccessibleByMouse);
+}
+
+void Widget::handleDownloadRequest(const QUrl &url)
+{
+    // 立即阻止所有后续处理
+    // 设置标志位防止QTextBrowser处理
+    isHandlingDownload = true;
+
+    // 延迟处理，确保事件循环完成
+    QTimer::singleShot(0, this, [this, url]() {
+        if (url.scheme() == "file") {
+            QString filePath = url.toLocalFile();
+            QFileInfo fileInfo(filePath);
+
+            if (fileInfo.exists()) {
+                QMessageBox msgBox;
+                msgBox.setWindowTitle("文件操作");
+                msgBox.setText(QString("文件: %1").arg(fileInfo.fileName()));
+                msgBox.setInformativeText("你想要打开文件还是打开所在文件夹？");
+
+                QPushButton *openButton = msgBox.addButton("打开文件", QMessageBox::ActionRole);
+                QPushButton *openFolderButton = msgBox.addButton("打开文件夹", QMessageBox::ActionRole);
+                QPushButton *cancelButton = msgBox.addButton("取消", QMessageBox::RejectRole);
+
+                msgBox.exec();
+
+                if (msgBox.clickedButton() == openButton) {
+                    // 使用系统默认程序打开文件
+                    QDesktopServices::openUrl(QUrl::fromLocalFile(filePath));
+                } else if (msgBox.clickedButton() == openFolderButton) {
+                    // 打开文件所在文件夹
+                    QString folderPath = QFileInfo(filePath).absolutePath();
+                    QDesktopServices::openUrl(QUrl::fromLocalFile(folderPath));
+                }
+            } else {
+                QMessageBox::warning(this, "文件不存在", "文件不存在或已被移动: " + filePath);
+            }
+        } else {
+            // 对于其他URL，直接打开
+            QDesktopServices::openUrl(url);
+        }
+
+        // 重置标志位
+        isHandlingDownload = false;
+
+        // 强制刷新QTextBrowser，清除可能残留的内容
+        ui->chatText->document()->clearUndoRedoStacks();
+        ui->chatText->document()->setModified(false);
+    });
 }
 
 Widget::~Widget()
@@ -97,7 +189,6 @@ void Widget::setupConnections()
     connect(tcpSocket, &QTcpSocket::connected, this, &Widget::onSocketConnected);
     connect(tcpSocket, &QTcpSocket::disconnected, this, &Widget::onSocketDisconnected);
     connect(tcpSocket, &QTcpSocket::readyRead, this, &Widget::onSocketReadyRead);
-    connect(tcpSocket, &QTcpSocket::bytesWritten, this, &Widget::onSocketBytesWritten);
     connect(tcpSocket, QOverload<QAbstractSocket::SocketError>::of(&QTcpSocket::errorOccurred),
             this, &Widget::onSocketError);
 }
@@ -106,8 +197,9 @@ void Widget::setupUI()
     // 设置控件属性
     ui->chatText->setReadOnly(true);
     ui->chatText->setAcceptRichText(true);
-    ui->chatText->setOpenLinks(true);
-    ui->chatText->setOpenExternalLinks(true);
+    // 关键：禁用链接自动打开，完全由我们自己处理
+    ui->chatText->setOpenLinks(false);  // 禁用自动打开链接
+    ui->chatText->setOpenExternalLinks(false);  // 禁用外部链接
 
     // 设置输入框提示
     ui->messageInput->setPlaceholderText("输入消息... (按Enter发送)");
@@ -219,7 +311,55 @@ void Widget::connectToServer()
         }
     });
 }
+void Widget::onSocketReadyRead()
+{
+    while (tcpSocket->bytesAvailable() > 0) {
+        QByteArray data = tcpSocket->readLine(); // 按行读取
 
+        if (data.isEmpty()) continue;
+
+        // 检查是否是二进制数据
+        if (isBinaryData(data)) {
+            qDebug() << "收到二进制数据，跳过显示";
+            continue; // 跳过二进制数据
+        }
+
+        QString message = QString::fromUtf8(data).trimmed();
+
+        // 尝试解析JSON消息
+        QJsonParseError parseError;
+        QJsonDocument jsonDoc = QJsonDocument::fromJson(message.toUtf8(), &parseError);
+
+        if (parseError.error == QJsonParseError::NoError) {
+            // 是JSON消息
+            processJsonMessage(jsonDoc.object());
+        } else {
+            // 是普通文本消息
+            processTextMessage(message);
+        }
+    }
+}
+
+// 检查是否是二进制数据
+bool Widget::isBinaryData(const QByteArray &data)
+{
+    // 检查数据中非打印字符的比例
+    int nonPrintable = 0;
+    for (int i = 0; i < data.size(); ++i) {
+        unsigned char c = data.at(i);
+        // 非打印字符（除空格、换行、制表符等）
+        if (c < 32 && c != 9 && c != 10 && c != 13) {
+            nonPrintable++;
+        }
+        // 如果检测到PNG文件头等二进制标志
+        if (i > 0 && data.at(i-1) == (char)0x89 && data.at(i) == 'P') {
+            return true;
+        }
+    }
+
+    // 如果超过10%是非打印字符，很可能是二进制数据
+    return (nonPrintable * 10 > data.size());
+}
 void Widget::onSocketConnected()
 {
     isConnected = true;
@@ -277,164 +417,6 @@ void Widget::onUploadClicked()
     sendFile(filePath);
 }
 
-void Widget::startNextUpload()
-{
-    if (pendingUploads.isEmpty()) {
-        currentUpload = nullptr;
-        ui->uploadProgressBar->setVisible(false);
-        ui->uploadStatusLabel->setText("就绪");
-        return;
-    }
-
-    currentUpload = pendingUploads.takeFirst();
-    currentUpload->isSending = true;
-
-    // 发送文件头信息
-    QByteArray header;
-    QDataStream stream(&header, QIODevice::WriteOnly);
-    stream.setVersion(QDataStream::Qt_5_15);
-
-    // 文件头格式：类型(4字节) + 文件名长度(4字节) + 文件名 + 文件大小(8字节)
-    stream << (qint32)currentUpload->fileType;
-
-    QByteArray fileNameBytes = currentUpload->fileName.toUtf8();
-    stream << (qint32)fileNameBytes.size();
-    stream.writeRawData(fileNameBytes.constData(), fileNameBytes.size());
-
-    stream << (qint64)currentUpload->fileSize;
-
-    // 添加头标识
-    QByteArray fullHeader;
-    fullHeader.append("FILE_START");
-    fullHeader.append(header);
-
-    tcpSocket->write(fullHeader);
-
-    // 显示上传状态
-    ui->uploadProgressBar->setVisible(true);
-    ui->uploadProgressBar->setValue(0);
-    ui->uploadStatusLabel->setText(QString("正在上传: %1").arg(currentUpload->fileName));
-
-    // 开始发送第一个数据块
-    QTimer::singleShot(100, this, &Widget::sendFileChunk);
-}
-
-void Widget::sendFileChunk()
-{
-    if (!currentUpload || !currentUpload->file) {
-        return;
-    }
-
-    // 读取数据块
-    QByteArray chunk = currentUpload->file->read(CHUNK_SIZE);
-    if (chunk.isEmpty()) {
-        // 文件发送完成
-        currentUpload->file->close();
-        delete currentUpload->file;
-        delete currentUpload;
-        currentUpload = nullptr;
-
-        // appendSystemMessage("文件上传完成");
-
-        // 开始下一个上传
-        startNextUpload();
-        return;
-    }
-
-    // 发送数据块
-    QByteArray dataPacket;
-    dataPacket.append("FILE_DATA");
-    dataPacket.append(chunk);
-
-    tcpSocket->write(dataPacket);
-
-    // 更新进度
-    currentUpload->bytesWritten += chunk.size();
-    updateUploadProgress(currentUpload->bytesWritten, currentUpload->bytesTotal);
-}
-
-void Widget::onSocketBytesWritten(qint64 bytes)
-{
-    Q_UNUSED(bytes);
-
-    // 继续发送下一个数据块
-    if (currentUpload && currentUpload->isSending) {
-        QTimer::singleShot(10, this, &Widget::sendFileChunk);
-    }
-}
-void Widget::updateUploadProgress(qint64 bytesWritten, qint64 bytesTotal)
-{
-    int progress = (bytesTotal > 0) ? (bytesWritten * 100 / bytesTotal) : 0;
-    ui->uploadProgressBar->setValue(progress);
-
-    if (currentUpload) {
-        ui->uploadStatusLabel->setText(
-            QString("上传中: %1 (%2/%3)")
-                .arg(currentUpload->fileName)
-                .arg(formatFileSize(bytesWritten))
-                .arg(formatFileSize(bytesTotal))
-            );
-    }
-}
-void Widget::sendFile(const QString &filePath)
-{
-    QFile *file = new QFile(filePath);
-    if (!file->open(QIODevice::ReadOnly)) {
-        QMessageBox::warning(this, "错误", "无法打开文件");
-        delete file;
-        return;
-    }
-
-    FileTransfer *transfer = new FileTransfer();
-    transfer->file = file;
-    transfer->fileName = QFileInfo(filePath).fileName();
-    transfer->fileSize = file->size();
-    transfer->fileType = getFileType(filePath);
-    transfer->bytesWritten = 0;
-    transfer->bytesTotal = transfer->fileSize;
-    transfer->isSending = false;
-
-    // 先在聊天窗口显示自己的上传消息（使用更新后的函数）
-    if (transfer->fileType == Image) {
-        QImage image(filePath);
-        if (!image.isNull()) {
-            // 传递5个参数
-            appendImageMessage(username, image, transfer->fileName, filePath, true);
-        }
-    } else {
-        // 传递5个参数
-        appendFileMessage(username, transfer->fileName, transfer->fileSize, filePath, true);
-    }
-
-    // 添加到上传队列
-    pendingUploads.append(transfer);
-
-    // 如果没有正在进行的上传，开始上传
-    if (!currentUpload) {
-        startNextUpload();
-    } else {
-        appendSystemMessage(QString("文件 '%1' 已添加到上传队列").arg(transfer->fileName));
-    }
-}
-void Widget::onSocketReadyRead()
-{
-    while (tcpSocket->bytesAvailable() > 0) {
-        QByteArray data = tcpSocket->readAll();
-
-        // 检查是否是文件传输相关数据
-        if (data.startsWith("FILE_START")) {
-            processFileHeader(data.mid(10)); // 移除标识
-        } else if (data.startsWith("FILE_DATA")) {
-            processFileChunk(data.mid(9)); // 移除标识
-        } else if (data.startsWith("IMAGE_MSG")) {
-            processImageMessage(data.mid(9));
-        } else {
-            // 处理文本消息
-            QString message = QString::fromUtf8(data).trimmed();
-            processTextMessage(message);
-        }
-    }
-}
 void Widget::onSocketDisconnected()
 {
     isConnected = false;
@@ -456,72 +438,6 @@ void Widget::onSocketDisconnected()
     // 尝试自动重连（可选）
     if (ui->autoReconnectCheck->isChecked()) {
         QTimer::singleShot(3000, this, &Widget::connectToServer);
-    }
-}
-void Widget::processFileHeader(const QByteArray &data)
-{
-    QDataStream stream(data);
-    stream.setVersion(QDataStream::Qt_5_15);
-
-    qint32 fileType;
-    qint32 fileNameLength;
-    qint64 fileSize;
-
-    stream >> fileType;
-    stream >> fileNameLength;
-
-    char *fileNameBuffer = new char[fileNameLength + 1];
-    stream.readRawData(fileNameBuffer, fileNameLength);
-    fileNameBuffer[fileNameLength] = '\0';
-    receivedFileName = QString::fromUtf8(fileNameBuffer, fileNameLength);
-    delete[] fileNameBuffer;
-
-    stream >> fileSize;
-
-    // 保存接收文件的信息
-    receivedFileType = static_cast<FileType>(fileType);
-    totalFileSize = fileSize;
-
-    // 清空并准备缓冲区
-    uploadBuffer.clear();
-    uploadBuffer.reserve(fileSize);
-
-    // 显示接收信息和进度条
-    ui->uploadProgressBar->setVisible(true);
-    ui->uploadProgressBar->setValue(0);
-    ui->uploadStatusLabel->setText(QString("正在接收: %1").arg(receivedFileName));
-
-    appendSystemMessage(QString("正在接收文件: %1 (%2)")
-                            .arg(receivedFileName)
-                            .arg(formatFileSize(fileSize)));
-}
-void Widget::processFileChunk(const QByteArray &data)
-{
-    uploadBuffer.append(data);
-
-    // 更新进度显示
-    if (totalFileSize > 0) {
-        int progress = (uploadBuffer.size() * 100) / totalFileSize;
-        ui->uploadProgressBar->setValue(progress);
-        ui->uploadStatusLabel->setText(
-            QString("正在接收: %1 (%2%)")
-                .arg(receivedFileName)
-                .arg(progress)
-            );
-    }
-
-    // 文件接收完成
-    if (uploadBuffer.size() >= totalFileSize && totalFileSize > 0) {
-        // 保存接收的文件
-        saveReceivedFile(uploadBuffer, receivedFileName, receivedFileType);
-
-        // 重置状态
-        uploadBuffer.clear();
-        totalFileSize = 0;
-        uploadBuffer.reserve(0);
-
-        ui->uploadProgressBar->setVisible(false);
-        ui->uploadStatusLabel->setText("就绪");
     }
 }
 void Widget::processImageMessage(const QByteArray &data)
@@ -579,6 +495,51 @@ void Widget::processImageMessage(const QByteArray &data)
         appendImageMessage(senderName, image, fileName, savePath, senderName != username);
     }
 }
+void Widget::processJsonMessage(const QJsonObject &jsonObj)
+{
+    if (!jsonObj.contains("type")) return;
+
+    QString type = jsonObj["type"].toString();
+    QString sender = jsonObj["sender"].toString();
+
+    if (type == "text") {
+        // 只处理文本消息
+        QString content = jsonObj["content"].toString();
+        QString timestamp = jsonObj["timestamp"].toString();
+
+        // 显示文本消息
+        appendMessage(sender, content, sender == username);
+    }
+    else if (type == "file_base64" || type == "image_base64") {
+        // 处理文件/图片消息，但不显示文件内容
+        QString fileName = jsonObj["filename"].toString();
+        qint64 fileSize = jsonObj["filesize"].toString().toLongLong();
+        QString base64Data = jsonObj["filedata"].toString();
+
+        // 解码Base64数据
+        QByteArray fileData = QByteArray::fromBase64(base64Data.toUtf8());
+
+        // 保存文件（但不显示二进制内容）
+        QString savePath = saveBase64File(fileName, fileData, type == "image_base64");
+
+        if (!savePath.isEmpty()) {
+            // 创建文件消息（只显示文件名和下载链接，不显示文件内容）
+            QString currentTime = QDateTime::currentDateTime().toString("hh:mm:ss");
+
+            QString html;
+            if (type == "image_base64") {
+                QImage image;
+                if (image.loadFromData(fileData)) {
+                    // 只显示缩略图和下载链接
+                    appendImageMessage(sender, image, fileName, savePath, sender == username);
+                }
+            } else {
+                // 只显示文件信息和下载链接
+                appendFileMessage(sender, fileName, fileSize, savePath, sender == username);
+            }
+        }
+    }
+}
 void Widget::appendMessage(const QString &sender, const QString &message, bool isSelf)
 {
     QString time = getTimestamp();
@@ -599,10 +560,12 @@ void Widget::appendMessage(const QString &sender, const QString &message, bool i
                    .arg(message.toHtmlEscaped(), QDateTime::currentDateTime().toString("hh:mm:ss"));
     } else {
         // 他人发送的消息（左对齐）
-        html = QString("<div style='margin: 5px;'>"
+        html = QString(
+                       "<br/>"
+                       "<div style='margin: 5px;'>"
                        "<div style='color: #666; font-size: 10px;'>"
-                       "<span style='color: #333; font-weight: bold; margin-right: 5px;'>%1</span>"
-                       "<span style='background: #F0F0F0; color: black; padding: 4px 8px; "
+                       "<span style='color: #333; font-weight: bold; margin-right: 5px;'>[%1]:</span>"
+                       "<span style='color: black; padding: 4px 8px; "
                        "border-radius: 8px; display: inline;'>%2</span>"
                        "</div>"
                        "<div style='color: #999; font-size: 9px; margin-top: 2px;'>接收时间: %3</div>"
@@ -622,7 +585,6 @@ void Widget::appendMessage(const QString &sender, const QString &message, bool i
 void Widget::appendFileMessage(const QString &sender, const QString &fileName, qint64 fileSize,
                                const QString &filePath, bool isSelf)
 {
-    QString time = getTimestamp();
     QString sizeStr = formatFileSize(fileSize);
     QString html;
 
@@ -649,11 +611,14 @@ void Widget::appendFileMessage(const QString &sender, const QString &fileName, q
         fileIcon = "📎";
     }
 
-    // 创建下载链接 - 修复这里
+    // 创建文件URL链接
     QString fileUrl = QUrl::fromLocalFile(filePath).toString();
-    QString downloadLink = QString("<a href='%1' style='color: inherit; text-decoration: none;'>%2</a>")
-                               .arg(fileUrl, fileName.toHtmlEscaped());
+    QString downloadLink = QString("<a href='%1' style='color: #007AFF; text-decoration: none;'>💾 点击下载</a>")
+                               .arg(fileUrl);
 
+    QString currentTime = QDateTime::currentDateTime().toString("hh:mm:ss");
+
+    // 使用简单的HTML，不包含复杂的JavaScript
     if (isSelf) {
         html = QString(
                    "<br/>"
@@ -663,39 +628,41 @@ void Widget::appendFileMessage(const QString &sender, const QString &fileName, q
                    "</div>"
                    "<div style='color: #049e04; padding: 12px 15px; "
                    "border-radius: 10px; display: inline-block; max-width: 300px; "
-                   "margin-top: 2px; margin-bottom: 5px; cursor: pointer;'>"
+                   "margin-top: 2px; margin-bottom: 5px;'>"
                    "<div style='font-size: 16px; margin-bottom: 5px;'>%1</div>"
                    "<div style='font-weight: bold; font-size: 12px;'>%2</div>"
                    "<div style='font-size: 11px; opacity: 0.9; margin-top: 5px;'>"
                    "📏 大小: %3<br>"
-                   "💾 点击文件名下载"
+                   "%4"
                    "</div>"
                    "</div>"
-                   "<div style='color: #999; font-size: 9px;'>发送时间: %4</div>"
+                   "<div style='color: #999; font-size: 9px;'>发送时间: %5</div>"
                    "</div>")
-                   .arg(fileIcon, downloadLink, sizeStr,
-                        QDateTime::currentDateTime().toString("hh:mm:ss"));
+                   .arg(fileIcon, fileName.toHtmlEscaped(), sizeStr,
+                        downloadLink, // 使用下载链接
+                        currentTime); // 修复：使用单独的变量
     } else {
-        html = QString("<div style='margin: 5px;'>"
+        html = QString(
+                       "<br/>"
+                       "<div style='margin: 5px;'>"
                        "<div style='color: #666; font-size: 10px;'>"
-                       "<span style='color: #333; font-weight: bold; margin-right: 5px;'>%1</span>"
+                       "<span style='color: #333; font-weight: bold; margin-right: 5px;'>[%1]</span>"
                        "</div>"
-                       "<div style='background: #F0F0F0; color: #333; padding: 12px 15px; "
+                       "<div style='color: #333; padding: 12px 15px; "
                        "border-radius: 10px; display: inline-block; max-width: 300px; "
-                       "margin-top: 2px; margin-bottom: 5px; cursor: pointer;'>"
+                       "margin-top: 2px; margin-bottom: 5px;'>"
                        "<div style='font-size: 16px; margin-bottom: 5px;'>%2</div>"
                        "<div style='font-weight: bold; font-size: 12px;'>%3</div>"
                        "<div style='font-size: 11px; opacity: 0.9; margin-top: 5px;'>"
                        "📏 大小: %4<br>"
-                       "⏰ 时间: %5<br>"
-                       "💾 点击文件名下载"
+                       "%5"
                        "</div>"
                        "</div>"
                        "<div style='color: #999; font-size: 9px; margin-top: 2px;'>发送时间: %6</div>"
                        "</div>")
-                   .arg(sender, fileIcon, downloadLink, sizeStr,
-                        QDateTime::currentDateTime().toString("hh:mm:ss"),
-                        QDateTime::currentDateTime().toString("hh:mm:ss"));
+                   .arg(sender, fileIcon, fileName.toHtmlEscaped(), sizeStr,
+                        downloadLink, // 使用下载链接
+                        currentTime); // 修复：使用单独的变量
     }
 
     QTextCursor cursor(ui->chatText->document());
@@ -719,56 +686,56 @@ void Widget::appendImageMessage(const QString &sender, const QImage &image, cons
     scaledImage.save(&buffer, "PNG");
     QString base64Image = QString::fromLatin1(byteArray.toBase64().data());
 
-    QString time = getTimestamp();
+    QString currentTime = QDateTime::currentDateTime().toString("hh:mm:ss"); // 修复：正确的时间格式
     QString html;
 
-    // 创建下载链接
+    // 创建文件URL链接
     QString fileUrl = QUrl::fromLocalFile(filePath).toString();
     QString downloadLink = QString("<a href='%1' style='color: inherit; text-decoration: none;'>%2</a>")
                                .arg(fileUrl, fileName.toHtmlEscaped());
 
     if (isSelf) {
         html = QString(
+                   "<br/>"
+                   "<div style='margin: 10px;'>"
+                   "<div style='color: #666; font-size: 10px;'>"
+                   "<span style='color: #0ba50b; font-weight: bold;'>[我]</span>"
+                   "</div>"
+                   "<div style='padding: 10px; border-radius: 10px; "
+                   "display: inline-block; max-width: 300px; margin-top: 2px; margin-bottom: 5px;'>"
+                   "<a href='%1' style='text-decoration: none;'>"
+                   "<img src='data:image/png;base64,%2' "
+                   "style='max-width: 280px; border-radius: 5px; cursor: pointer;'/>"
+                   "</a><br>"
+                   "<div style='color:#049e04; font-size: 10px; margin-top: 5px;'>"
+                   "🖼️ %3 "
+                   "💾 点击图片查看"
+                   "</div>"
+                   "</div>"
+                   "<div style='color: #999; font-size: 9px;'>发送时间: %4</div>"
+                   "</div>")
+                   .arg(fileUrl, base64Image, downloadLink, currentTime); // 修复：正确的参数数量
+    } else {
+        html = QString(
                        "<br/>"
                        "<div style='margin: 10px;'>"
                        "<div style='color: #666; font-size: 10px;'>"
-                       "<span style='color: #0ba50b; font-weight: bold;'>[我]</span>"
+                       "<span style='color: #333; font-weight: bold;'>[%1]</span> "
                        "</div>"
-                       "<div style='padding: 10px; border-radius: 10px; "
+                       "<div style=' padding: 10px; border-radius: 10px; "
                        "display: inline-block; max-width: 300px; margin-top: 2px; margin-bottom: 5px;'>"
-                       "<img src='data:image/png;base64,%1' "
-                       "style='max-width: 280px; border-radius: 5px; cursor: pointer;'/><br>"
-                       "<div style='color:#049e04; font-size: 10px; margin-top: 5px;'>"
-                       "🖼️ %2 "
-                       "💾 点击文件名下载"
-                       "</div>"
-                       "</div>"
-                       "<div style='color: #999; font-size: 9px;'>发送时间: %5</div>"
-                       "</div>")
-                   .arg(base64Image, downloadLink,
-                        QDateTime::currentDateTime().toString("hh:mm:ss"),
-                        QDateTime::currentDateTime().toString("hh:mm:ss"));
-    } else {
-        html = QString("<div style='margin: 10px;'>"
-                       "<div style='color: #666; font-size: 10px;'>"
-                       "<span style='color: #333; font-weight: bold;'>%1</span> "
-                       "<span style='color: #999;'>%2</span>"
-                       "</div>"
-                       "<div style='background: #F0F0F0; padding: 10px; border-radius: 10px; "
-                       "display: inline-block; max-width: 300px; margin-top: 2px; margin-bottom: 5px;'>"
+                       "<a href='%2' style='text-decoration: none;'>"
                        "<img src='data:image/png;base64,%3' "
-                       "style='max-width: 280px; border-radius: 5px; cursor: pointer;'/><br>"
+                       "style='max-width: 280px; border-radius: 5px; cursor: pointer;'/>"
+                       "</a><br>"
                        "<div style='color: #666; font-size: 10px; margin-top: 5px;'>"
                        "🖼️ %4<br>"
-                       "⏰ %5<br>"
-                       "💾 点击图片查看大图"
+                       "💾 点击图片查看"
                        "</div>"
                        "</div>"
-                       "<div style='color: #999; font-size: 9px;'>接收时间: %6</div>"
+                       "<div style='color: #999; font-size: 9px;'>接收时间: %5</div>"
                        "</div>")
-                   .arg(sender, time, base64Image, downloadLink,
-                        QDateTime::currentDateTime().toString("hh:mm:ss"),
-                        QDateTime::currentDateTime().toString("hh:mm:ss"));
+                   .arg(sender, fileUrl, base64Image, downloadLink, currentTime); // 修复：正确的参数
     }
 
     QTextCursor cursor(ui->chatText->document());
@@ -781,11 +748,13 @@ void Widget::appendImageMessage(const QString &sender, const QImage &image, cons
 
 void Widget::appendSystemMessage(const QString &message)
 {
-    QString html = QString("<div style='text-align: center; margin: 10px;'>"
+    QString html = QString(
+                           "<br/>"
+                           "<div style='text-align: center; margin: 10px;'>"
                            "<span style='color: #888; font-size: 11px; "
-                           "background: #F8F8F8; padding: 5px 10px; border-radius: 10px; "
+                           "padding: 5px 10px; border-radius: 10px; "
                            "display: inline-block;'>"
-                           "ⓘ %1<br>"
+                           "[系统]%1<br>"
                            "<span style='font-size: 9px; color: #aaa;'>%2</span>"
                            "</span>"
                            "</div>")
@@ -803,31 +772,37 @@ void Widget::processTextMessage(const QString &message)
 {
     if (message.isEmpty()) return;
 
-    // 处理服务器消息
-    if (message.startsWith("[System]")) {
-        QString systemMsg = message.mid(9);
+    // 处理服务器系统消息
+    if (message.startsWith("[系统]") || message.startsWith("[System]")) {
+        QString systemMsg = message.mid(message.indexOf("]") + 1).trimmed();
         appendSystemMessage(systemMsg);
 
-        if (systemMsg.contains("加入了聊天室") || systemMsg.contains("离开了聊天室")) {
+        // 更新用户列表
+        if (systemMsg.contains("加入了") || systemMsg.contains("离开了")) {
             updateUserList();
         }
-    } else if (message.startsWith("在线用户")) {
+    }
+    // 处理用户列表消息
+    else if (message.contains("在线用户")) {
         ui->userList->clear();
-        QString userListStr = message.mid(message.indexOf(":") + 1);
-        QStringList users = userListStr.split(",", Qt::SkipEmptyParts);
+        QStringList parts = message.split(":");
+        if (parts.size() > 1) {
+            QString userListStr = parts[1].trimmed();
+            QStringList users = userListStr.split(",", Qt::SkipEmptyParts);
 
-        for (const QString &user : users) {
-            QString trimmedUser = user.trimmed();
-            if (!trimmedUser.isEmpty()) {
-                QListWidgetItem *item = new QListWidgetItem(trimmedUser);
-                // item->setIcon(QIcon(":/icons/user.png"));
-                ui->userList->addItem(item);
+            for (const QString &user : users) {
+                QString trimmedUser = user.trimmed();
+                if (!trimmedUser.isEmpty()) {
+                    QListWidgetItem *item = new QListWidgetItem(trimmedUser);
+                    ui->userList->addItem(item);
+                }
             }
         }
-    } else {
-        QString pattern = "\\[(\\d{1,2}:\\d{2})\\] (\\w+): (.+)";
-        QRegularExpression re(pattern);
-        QRegularExpressionMatch match = re.match(message);
+    }
+    // 处理普通聊天消息格式 [时间] 用户名: 消息
+    else {
+        QRegularExpression pattern("\\[(\\d{1,2}:\\d{2})\\] (.+?): (.+)");
+        QRegularExpressionMatch match = pattern.match(message);
 
         if (match.hasMatch()) {
             QString time = match.captured(1);
@@ -836,6 +811,7 @@ void Widget::processTextMessage(const QString &message)
 
             appendMessage(sender, content, sender == username);
         } else {
+            // 如果不是标准格式，显示为系统消息
             appendSystemMessage(message);
         }
     }
@@ -996,7 +972,79 @@ void Widget::onMessageReturnPressed()
 {
     onSendClicked();
 }
+void Widget::sendFile(const QString &filePath)
+{
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this, "错误", "无法打开文件");
+        return;
+    }
 
+    QByteArray fileData = file.readAll();
+    file.close();
+
+    QFileInfo fileInfo(filePath);
+    QString fileName = fileInfo.fileName();
+    qint64 fileSize = fileInfo.size();
+    FileType fileType = getFileType(filePath);
+
+    // 转换为Base64
+    QString base64Data = fileData.toBase64();
+
+    // 限制文件大小（例如10MB）
+    if (fileSize > 10 * 1024 * 1024) {
+        QMessageBox::warning(this, "文件太大", "文件大小超过10MB限制");
+        return;
+    }
+
+    // 保存到自己本地的LANChat目录
+    QString savePath = saveBase64File(fileName, fileData, fileType == Image);
+    if (savePath.isEmpty()) {
+        QMessageBox::warning(this, "错误", "无法保存文件到本地");
+        return;
+    }
+
+    // 构建JSON格式的消息
+    QJsonObject fileJson;
+    fileJson["type"] = fileType == Image ? "image_base64" : "file_base64";
+    fileJson["sender"] = username;
+    fileJson["filename"] = fileName;
+    fileJson["filesize"] = QString::number(fileSize);
+    fileJson["filedata"] = base64Data;
+
+    if (fileType == Image) {
+        QImage image(filePath);
+        if (!image.isNull()) {
+            // 获取图片尺寸信息
+            fileJson["width"] = image.width();
+            fileJson["height"] = image.height();
+
+            // 显示在聊天窗口（不等待服务器返回）
+            // 使用保存到本地目录的路径，而不是原始路径
+            appendImageMessage(username, image, fileName, savePath, true);
+        }
+    } else {
+        // 显示文件消息（不等待服务器返回）
+        // 使用保存到本地目录的路径，而不是原始路径
+        appendFileMessage(username, fileName, fileSize, savePath, true);
+    }
+
+    // 发送JSON消息
+    QJsonDocument doc(fileJson);
+    QString jsonString = doc.toJson(QJsonDocument::Compact);
+    tcpSocket->write(jsonString.toUtf8() + "\n");
+
+    // 显示上传状态
+    ui->uploadProgressBar->setVisible(true);
+    ui->uploadProgressBar->setValue(100);
+    ui->uploadStatusLabel->setText(QString("已上传: %1").arg(fileName));
+
+    // 2秒后隐藏进度条
+    QTimer::singleShot(2000, this, [this]() {
+        ui->uploadProgressBar->setVisible(false);
+        ui->uploadStatusLabel->setText("就绪");
+    });
+}
 void Widget::sendMessage(const QString &message)
 {
     if (!isConnected) {
@@ -1011,9 +1059,16 @@ void Widget::sendMessage(const QString &message)
         return;
     }
 
-    // 发送普通消息
-    QString formattedMsg = QString("CHAT:%1:%2").arg(username).arg(message);
-    tcpSocket->write(formattedMsg.toUtf8());
+    // 发送JSON格式的文本消息
+    QJsonObject msgJson;
+    msgJson["type"] = "text";
+    msgJson["sender"] = username;
+    msgJson["content"] = message;
+    msgJson["timestamp"] = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
+
+    QJsonDocument doc(msgJson);
+    QString jsonString = doc.toJson(QJsonDocument::Compact);
+    tcpSocket->write(jsonString.toUtf8() + "\n");
 
     // 在本地显示自己发送的消息
     appendMessage(username, message, true);
@@ -1038,7 +1093,37 @@ void Widget::sendCommand(const QString &command)
     }
 }
 
+QString Widget::saveBase64File(const QString &fileName, const QByteArray &fileData, bool isImage)
+{
+    QString saveDir;
 
+    if (isImage) {
+        saveDir = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation) + "/LANChat/";
+    } else {
+        saveDir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/LANChat/";
+    }
+
+    QDir().mkpath(saveDir);
+
+    // 如果文件名已存在，添加时间戳
+    QString savePath = saveDir + fileName;
+    QFileInfo fileInfo(savePath);
+    if (fileInfo.exists()) {
+        QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss");
+        QString baseName = fileInfo.baseName();
+        QString suffix = fileInfo.suffix();
+        savePath = saveDir + baseName + "_" + timestamp + "." + suffix;
+    }
+
+    QFile file(savePath);
+    if (file.open(QIODevice::WriteOnly)) {
+        file.write(fileData);
+        file.close();
+        return savePath;
+    }
+
+    return "";
+}
 QString Widget::getTimestamp()
 {
     return QTime::currentTime().toString("hh:mm");
