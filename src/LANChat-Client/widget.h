@@ -80,7 +80,7 @@ private:
     bool isConnected;
     QString serverAddress;
     quint16 serverPort;
-
+    bool isProcessingDownload;
     // 文件上传相关
     enum FileType {
         Text = 0,

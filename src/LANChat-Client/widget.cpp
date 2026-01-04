@@ -37,9 +37,11 @@ Widget::Widget(QWidget *parent)
     , isConnected(false)
     , serverAddress("127.0.0.1")
     , serverPort(8888)
+    , isProcessingDownload(false)
     , totalFileSize(0)
     , currentUpload(nullptr)
     , isHandlingDownload(false)
+
 {
     ui->setupUi(this);
 
@@ -75,17 +77,9 @@ bool Widget::eventFilter(QObject *obj, QEvent *event)
 
 void Widget::setupTextBrowserConnections()
 {
-    // 连接QTextBrowser的锚点点击信号
+    // 只连接一次，避免重复处理
+    disconnect(ui->chatText, &QTextBrowser::anchorClicked, this, nullptr);
     connect(ui->chatText, &QTextBrowser::anchorClicked, this, &Widget::handleDownloadRequest);
-
-    // 额外连接：捕获QTextBrowser的链接激活信号（如果有的话）
-    connect(ui->chatText, &QTextBrowser::anchorClicked, this, [this](const QUrl &url) {
-        // 阻止所有默认行为
-        ui->chatText->setTextInteractionFlags(Qt::TextSelectableByMouse);
-
-        // 手动处理链接
-        handleDownloadRequest(url);
-    });
 }
 void Widget::cleanTextBrowser()
 {
@@ -101,35 +95,59 @@ void Widget::cleanTextBrowser()
 void Widget::handleDownloadRequest(const QUrl &url)
 {
     // 立即阻止所有后续处理
-    // 设置标志位防止QTextBrowser处理
-    isHandlingDownload = true;
+    // 设置标志位防止重复处理
+    if (isProcessingDownload) {
+        return;  // 如果正在处理，直接返回
+    }
+
+    isProcessingDownload = true;
+
+    isProcessingDownload = true;
 
     // 延迟处理，确保事件循环完成
-    QTimer::singleShot(0, this, [this, url]() {
+    QTimer::singleShot(100, this, [this, url]() {
         if (url.scheme() == "file") {
             QString filePath = url.toLocalFile();
             QFileInfo fileInfo(filePath);
 
             if (fileInfo.exists()) {
-                QMessageBox msgBox;
-                msgBox.setWindowTitle("文件操作");
-                msgBox.setText(QString("文件: %1").arg(fileInfo.fileName()));
-                msgBox.setInformativeText("你想要打开文件还是打开所在文件夹？");
+                // 创建一个模态对话框，防止事件循环问题
+                QDialog dialog(this);
+                dialog.setWindowTitle("文件操作");
 
-                QPushButton *openButton = msgBox.addButton("打开文件", QMessageBox::ActionRole);
-                QPushButton *openFolderButton = msgBox.addButton("打开文件夹", QMessageBox::ActionRole);
-                QPushButton *cancelButton = msgBox.addButton("取消", QMessageBox::RejectRole);
+                QVBoxLayout *layout = new QVBoxLayout(&dialog);
+                QLabel *label = new QLabel(QString("文件: %1").arg(fileInfo.fileName()), &dialog);
+                layout->addWidget(label);
 
-                msgBox.exec();
+                QLabel *infoLabel = new QLabel("你想要打开文件还是打开所在文件夹？", &dialog);
+                layout->addWidget(infoLabel);
 
-                if (msgBox.clickedButton() == openButton) {
-                    // 使用系统默认程序打开文件
+                QHBoxLayout *buttonLayout = new QHBoxLayout();
+                QPushButton *openButton = new QPushButton("打开文件", &dialog);
+                QPushButton *openFolderButton = new QPushButton("打开文件夹", &dialog);
+                QPushButton *cancelButton = new QPushButton("取消", &dialog);
+
+                buttonLayout->addWidget(openButton);
+                buttonLayout->addWidget(openFolderButton);
+                buttonLayout->addWidget(cancelButton);
+                layout->addLayout(buttonLayout);
+
+                // 连接按钮信号
+                connect(openButton, &QPushButton::clicked, &dialog, [&dialog, filePath]() {
                     QDesktopServices::openUrl(QUrl::fromLocalFile(filePath));
-                } else if (msgBox.clickedButton() == openFolderButton) {
-                    // 打开文件所在文件夹
+                    dialog.accept();
+                });
+
+                connect(openFolderButton, &QPushButton::clicked, &dialog, [&dialog, filePath]() {
                     QString folderPath = QFileInfo(filePath).absolutePath();
                     QDesktopServices::openUrl(QUrl::fromLocalFile(folderPath));
-                }
+                    dialog.accept();
+                });
+
+                connect(cancelButton, &QPushButton::clicked, &dialog, &QDialog::reject);
+
+                // 显示对话框
+                dialog.exec();
             } else {
                 QMessageBox::warning(this, "文件不存在", "文件不存在或已被移动: " + filePath);
             }
@@ -139,11 +157,7 @@ void Widget::handleDownloadRequest(const QUrl &url)
         }
 
         // 重置标志位
-        isHandlingDownload = false;
-
-        // 强制刷新QTextBrowser，清除可能残留的内容
-        ui->chatText->document()->clearUndoRedoStacks();
-        ui->chatText->document()->setModified(false);
+        isProcessingDownload = false;
     });
 }
 
@@ -220,6 +234,18 @@ void Widget::setupUI()
     ui->uploadProgressBar->setValue(0);
     ui->uploadProgressBar->setVisible(false);
     ui->uploadStatusLabel->setText("就绪");
+
+    // 初始化用户列表
+    ui->userList->clear();
+    QListWidgetItem *defaultItem = new QListWidgetItem("所有人");
+    ui->userList->addItem(defaultItem);
+    ui->userList->setCurrentItem(defaultItem);
+
+    // 设置用户列表样式
+    ui->userList->setAlternatingRowColors(true);
+    QFont font = ui->userList->font();
+    font.setPointSize(10);
+    ui->userList->setFont(font);
 
     // 初始状态
     ui->disconnectButton->setEnabled(false);
@@ -379,6 +405,9 @@ void Widget::onSocketConnected()
 
     // 显示系统消息
     appendSystemMessage(QString("已连接到服务器 %1:%2").arg(serverAddress).arg(serverPort));
+
+    // 延迟请求用户列表（等待服务器处理登录）
+    QTimer::singleShot(100, this, &Widget::updateUserList);
 }
 
 void Widget::onUploadClicked()
@@ -428,9 +457,16 @@ void Widget::onSocketDisconnected()
     ui->disconnectButton->setEnabled(false);
     ui->messageInput->setEnabled(false);
     ui->sendButton->setEnabled(false);
+    ui->uploadButton->setEnabled(false);
 
     // 清空用户列表
     ui->userList->clear();
+
+    // 添加"所有人"选项
+    QListWidgetItem *item = new QListWidgetItem("所有人");
+    ui->userList->addItem(item);
+    ui->userList->setCurrentItem(item);
+    currentChatTarget = "所有人";
 
     // 显示系统消息
     appendSystemMessage("与服务器的连接已断开");
@@ -777,28 +813,65 @@ void Widget::processTextMessage(const QString &message)
         QString systemMsg = message.mid(message.indexOf("]") + 1).trimmed();
         appendSystemMessage(systemMsg);
 
-        // 更新用户列表
-        if (systemMsg.contains("加入了") || systemMsg.contains("离开了")) {
-            updateUserList();
+        // 如果系统消息包含用户加入或离开，更新用户列表
+        if (systemMsg.contains("加入了") || systemMsg.contains("离开了") ||
+            systemMsg.contains("加入") || systemMsg.contains("离开")) {
+            QTimer::singleShot(500, this, &Widget::updateUserList);
         }
+        return;
     }
+
     // 处理用户列表消息
-    else if (message.contains("在线用户")) {
-        ui->userList->clear();
+    else if (message.contains("在线用户") || message.contains("在线用户:")) {
         QStringList parts = message.split(":");
         if (parts.size() > 1) {
             QString userListStr = parts[1].trimmed();
             QStringList users = userListStr.split(",", Qt::SkipEmptyParts);
 
+            // 先保存当前选择的用户
+            QString selectedUser;
+            QListWidgetItem* selectedItem = ui->userList->currentItem();
+            if (selectedItem) {
+                selectedUser = selectedItem->text();
+            }
+
+            // 清空并重新填充用户列表
+            ui->userList->clear();
+
             for (const QString &user : users) {
                 QString trimmedUser = user.trimmed();
                 if (!trimmedUser.isEmpty()) {
                     QListWidgetItem *item = new QListWidgetItem(trimmedUser);
+
+                    // 如果是自己，添加特殊标记
+                    if (trimmedUser == username) {
+                        item->setText(trimmedUser + " (我)");
+                        item->setForeground(Qt::green);
+                        item->setFont(QFont("Arial", 10, QFont::Bold));
+                    }
+
                     ui->userList->addItem(item);
+
+                    // 恢复之前的选择
+                    if (trimmedUser == selectedUser) {
+                        item->setSelected(true);
+                        currentChatTarget = selectedUser;
+                    }
                 }
             }
+
+            // 如果没有选择且列表不为空，默认选择第一个
+            if (ui->userList->count() > 0 && !selectedItem) {
+                ui->userList->setCurrentRow(0);
+                currentChatTarget = ui->userList->item(0)->text();
+            }
+
+            // 更新状态栏显示在线人数
+            ui->statusLabel->setText(QString("已连接 - 在线: %1人").arg(users.size()));
         }
+        return;
     }
+
     // 处理普通聊天消息格式 [时间] 用户名: 消息
     else {
         QRegularExpression pattern("\\[(\\d{1,2}:\\d{2})\\] (.+?): (.+)");
@@ -1146,9 +1219,20 @@ void Widget::updateUserList()
 void Widget::onUserListItemClicked(QListWidgetItem *item)
 {
     QString selectedUser = item->text();
+
+    // 移除 "(我)" 标记（如果存在）
+    if (selectedUser.contains(" (我)")) {
+        selectedUser = selectedUser.replace(" (我)", "");
+    }
+
     if (selectedUser != currentChatTarget) {
         currentChatTarget = selectedUser;
-        appendSystemMessage(QString("正在与 %1 聊天").arg(selectedUser));
+
+        if (selectedUser == "所有人") {
+            appendSystemMessage("现在与所有人聊天");
+        } else {
+            appendSystemMessage(QString("正在与 %1 聊天").arg(selectedUser));
+        }
     }
 }
 

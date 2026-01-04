@@ -75,8 +75,16 @@ function handleJsonMessage(client: ClientInfo, jsonData: any, clientId: string):
             
         case 'file_base64':
         case 'image_base64':
-            // 广播文件消息
-            // console.log(`📁 ${sender} 发送了文件: ${jsonData.filename}`);
+            // 广播文件消息 - 简化日志输出
+            const fileName = jsonData.filename || 'unknown';
+            const fileSize = jsonData.filesize || 0;
+            
+            // 只显示文件名和大小，不显示完整JSON
+            if (type === 'image_base64') {
+                console.log(`🖼️ ${sender} 发送了图片: ${fileName} (${formatBytes(fileSize)})`);
+            } else {
+                console.log(`📁 ${sender} 发送了文件: ${fileName} (${formatBytes(fileSize)})`);
+            }
             
             // 确保发送者信息存在
             if (!jsonData.sender) {
@@ -102,6 +110,17 @@ function handleJsonMessage(client: ClientInfo, jsonData: any, clientId: string):
     }
 }
 
+// 辅助函数：格式化文件大小
+function formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 Bytes';
+    
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
 function handleTextMessage(client: ClientInfo, message: string, clientId: string): void {
     if (!message) return;
     
@@ -115,10 +134,8 @@ function handleTextMessage(client: ClientInfo, message: string, clientId: string
         client.socket.write(`[系统] 欢迎 ${client.username}！\n`);
         broadcast(`[系统] ${oldUsername} 加入了聊天室\n`, clientId);
         
-        // 发送在线用户列表
-        const userList = Array.from(clients.values())
-            .map(c => c.username)
-            .join(', ');
+        // 发送在线用户列表给所有客户端
+        sendUserListToAll();
         
         return;
     }
@@ -138,9 +155,46 @@ function handleTextMessage(client: ClientInfo, message: string, clientId: string
         return;
     }
     
+    // 处理USERS命令（客户端请求用户列表）
+    if (message === 'USERS' || message.trim() === 'USERS') {
+        sendUserListToClient(clientId);
+        return;
+    }
+    
     // 普通文本消息
     console.log(`💬 ${client.username}: ${message}`);
     broadcast(`[${new Date().toLocaleTimeString()}] ${client.username}: ${message}\n`, clientId);
+}
+
+// 发送用户列表给所有客户端
+function sendUserListToAll(): void {
+    const userList = Array.from(clients.values())
+        .map(c => c.username)
+        .join(', ');
+    
+    for (const [clientId, client] of clients.entries()) {
+        try {
+            client.socket.write(`在线用户: ${userList}\n`);
+        } catch (err) {
+            console.error(`发送用户列表失败 ${client.username}:`, err);
+        }
+    }
+}
+
+// 发送用户列表给特定客户端
+function sendUserListToClient(clientId: string): void {
+    const client = clients.get(clientId);
+    if (!client) return;
+    
+    const userList = Array.from(clients.values())
+        .map(c => c.username)
+        .join(', ');
+    
+    try {
+        client.socket.write(`在线用户: ${userList}\n`);
+    } catch (err) {
+        console.error(`发送用户列表失败 ${client.username}:`, err);
+    }
 }
 
 function broadcast(message: string, excludeClientId?: string): void {
