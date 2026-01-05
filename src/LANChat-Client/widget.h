@@ -1,4 +1,3 @@
-// widget.h
 #ifndef WIDGET_H
 #define WIDGET_H
 
@@ -72,6 +71,7 @@ private slots:
     void updateUserList();
     void startAutoConnect();
 
+
 private:
     Ui::Widget *ui;
     QTcpSocket *tcpSocket;
@@ -111,6 +111,18 @@ private:
     QString receivedFileName;       // 当前接收的文件名
     FileType receivedFileType;      // 当前接收的文件类型
 
+    // 私聊相关
+    struct PrivateChat {
+        QString targetUser;
+        QList<QString> messages;  // 私聊消息历史
+        bool isActive;
+    };
+
+    QMap<QString, PrivateChat> privateChats;  // 用户名 -> 私聊会话
+    QString currentPrivateTarget;  // 当前私聊目标
+
+    // 私聊相关函数
+    void showPrivateChatWindow(const QString &targetUser);
     // 初始化函数
     void setupUI();
     void setupConnections();
@@ -146,6 +158,19 @@ private:
 private slots:
     void handleDownloadRequest(const QUrl &url);
     void setupTextBrowserConnections();
+    // void onPrivateChatRequested(QListWidgetItem *item);
+    // void onClosePrivateChat();
+    // 用户列表右键菜单
+    void onUserListContextMenu(const QPoint &pos);
+
+    // 私聊相关
+    void startPrivateChat(const QString &targetUser);
+    void sendPrivateMessage(const QString &message, const QString &targetUser);
+    void updateUserListFromJson(const QJsonArray &usersArray);
+    void updateUserListWithStatus(const QString &user, bool online);
+    void updatePrivateChatIndicator();
+    void closePrivateChat(const QString &targetUser);
+    void showUserProfile(const QString &username);
 };
 
 #endif // WIDGET_H

@@ -1,4 +1,3 @@
-// index.ts (修复版)
 import net, { Socket } from 'net';
 import readline from 'readline';
 
@@ -8,6 +7,8 @@ interface ClientInfo {
     username: string;
     remoteAddress: string;
     remotePort: number;
+    online: boolean; // 添加在线状态
+    lastActive: Date; // 最后活动时间
 }
 
 const clients: Map<string, ClientInfo> = new Map();
@@ -20,11 +21,19 @@ const server = net.createServer((socket) => {
         socket,
         username: `User${clients.size + 1}`,
         remoteAddress: socket.remoteAddress || 'unknown',
-        remotePort: socket.remotePort || 0
+        remotePort: socket.remotePort || 0,
+        online: true,
+        lastActive: new Date()
     };
     
     clients.set(clientId, clientInfo);
     
+    // 广播用户上线通知
+    broadcastUserStatus(clientId, true);
+    
+    // 发送在线用户列表给新连接的用户
+    sendUserListToClient(clientId);
+
     // 发送欢迎消息
     socket.write('[系统] 欢迎使用局域网聊天室！请设置用户名\n');
     
@@ -45,6 +54,8 @@ const server = net.createServer((socket) => {
         console.log(`🔌 客户端断开: ${clientInfo.username} (${clientId})`);
         clients.delete(clientId);
         broadcast(`[系统] ${clientInfo.username} 离开了聊天室`, clientId);
+        // 广播用户下线通知
+        broadcastUserStatus(clientId, false);
     });
     
     socket.on('error', (err) => {
@@ -60,7 +71,13 @@ function handleJsonMessage(client: ClientInfo, jsonData: any, clientId: string):
     
     switch (type) {
         case 'text':
-            // 广播文本消息
+            // 检查是否为私聊消息
+            if (jsonData.target && jsonData.target !== '所有人') {
+                handlePrivateMessage(client, jsonData, clientId);
+                return;
+            }
+            
+            // 普通文本消息（群聊）
             const content = jsonData.content || '';
             const time = jsonData.timestamp || new Date().toLocaleTimeString();
             
@@ -69,21 +86,38 @@ function handleJsonMessage(client: ClientInfo, jsonData: any, clientId: string):
                 type: 'text',
                 sender: sender,
                 content: content,
-                timestamp: time
+                timestamp: time,
+                isPrivate: false
             }), clientId);
             break;
+        case 'private':
+            // 私聊消息
+            handlePrivateMessage(client, jsonData, clientId);
+            break;
             
+        // 在handleJsonMessage函数中，处理file_base64类型时：
         case 'file_base64':
-        case 'image_base64':
-            // 广播文件消息 - 简化日志输出
+        case 'image_base64': {
             const fileName = jsonData.filename || 'unknown';
             const fileSize = jsonData.filesize || 0;
+            let base64Data = jsonData.filedata || '';
             
-            // 只显示文件名和大小，不显示完整JSON
-            if (type === 'image_base64') {
-                console.log(`🖼️ ${sender} 发送了图片: ${fileName} (${formatBytes(fileSize)})`);
-            } else {
-                console.log(`📁 ${sender} 发送了文件: ${fileName} (${formatBytes(fileSize)})`);
+            // 清理Base64数据：移除可能的空格和换行符
+            base64Data = base64Data.replace(/\s+/g, '');
+            
+            // 验证Base64数据是否完整（长度应该是4的倍数）
+            if (base64Data.length % 4 !== 0) {
+                console.error(`❌ Base64数据不完整: ${fileName}，长度: ${base64Data.length}`);
+                // 可以尝试补全Base64（添加=）
+                const padding = 4 - (base64Data.length % 4);
+                base64Data += '='.repeat(padding);
+            }
+            
+            // 验证Base64格式
+            const base64Regex = /^[A-Za-z0-9+/]*={0,2}$/;
+            if (!base64Regex.test(base64Data)) {
+                console.error(`❌ Base64格式无效: ${fileName}`);
+                return;
             }
             
             // 确保发送者信息存在
@@ -91,9 +125,24 @@ function handleJsonMessage(client: ClientInfo, jsonData: any, clientId: string):
                 jsonData.sender = client.username;
             }
             
+            // 更新清理后的Base64数据
+            jsonData.filedata = base64Data;
+            
+            if (type === 'image_base64') {
+                console.log(`🖼️ ${sender} 发送了图片: ${fileName} (${formatBytes(fileSize)})`);
+            } else {
+                console.log(`📁 ${sender} 发送了文件: ${fileName} (${formatBytes(fileSize)})`);
+            }
+            
             // 直接转发JSON数据给所有客户端
-            broadcast(JSON.stringify(jsonData) + '\n', clientId);
+            try {
+                const jsonString = JSON.stringify(jsonData) + '\n';
+                broadcast(jsonString, clientId);
+            } catch (err) {
+                console.error(`❌ JSON序列化失败:`, err);
+            }
             break;
+        }
             
         case 'login':
             // 处理登录
@@ -109,7 +158,69 @@ function handleJsonMessage(client: ClientInfo, jsonData: any, clientId: string):
             console.log(`❓ 未知JSON类型: ${type}`);
     }
 }
-
+function handlePrivateMessage(client: ClientInfo, jsonData: any, clientId: string): void {
+    const targetUsername = jsonData.target;
+    const sender = jsonData.sender || client.username;
+    const content = jsonData.content || '';
+    
+    if (!targetUsername || targetUsername === '所有人') {
+        // 如果没有指定目标或目标是所有人，按普通消息处理
+        handleJsonMessage(client, jsonData, clientId);
+        return;
+    }
+    
+    // 查找目标用户
+    let targetClient: ClientInfo | null = null;
+    let targetClientId: string = '';
+    
+    for (const [id, info] of clients.entries()) {
+        if (info.username === targetUsername && info.online) {
+            targetClient = info;
+            targetClientId = id;
+            break;
+        }
+    }
+    
+    if (!targetClient) {
+        // 目标用户不在线，发送错误消息给发送者
+        const errorMsg = JSON.stringify({
+            type: 'error',
+            message: `用户 ${targetUsername} 不在线或不存在`,
+            timestamp: new Date().toLocaleTimeString()
+        });
+        client.socket.write(errorMsg + '\n');
+        return;
+    }
+    
+    if (targetClientId === clientId) {
+        // 不能给自己发私聊
+        const errorMsg = JSON.stringify({
+            type: 'error',
+            message: '不能给自己发送私聊消息',
+            timestamp: new Date().toLocaleTimeString()
+        });
+        client.socket.write(errorMsg + '\n');
+        return;
+    }
+    
+    // 构建私聊消息
+    const privateMessage = JSON.stringify({
+        type: 'private',
+        sender: sender,
+        target: targetUsername,
+        content: content,
+        timestamp: new Date().toLocaleTimeString(),
+        isOnline: true
+    });
+    
+    // 发送给目标用户
+    targetClient.socket.write(privateMessage + '\n');
+    
+    // 同时发送给发送者（显示在自己聊天窗口）
+    client.socket.write(privateMessage + '\n');
+    
+    console.log(`💌 私聊 ${sender} -> ${targetUsername}: ${content}`);
+}
 // 辅助函数：格式化文件大小
 function formatBytes(bytes: number): string {
     if (bytes === 0) return '0 Bytes';
@@ -168,16 +279,8 @@ function handleTextMessage(client: ClientInfo, message: string, clientId: string
 
 // 发送用户列表给所有客户端
 function sendUserListToAll(): void {
-    const userList = Array.from(clients.values())
-        .map(c => c.username)
-        .join(', ');
-    
     for (const [clientId, client] of clients.entries()) {
-        try {
-            client.socket.write(`在线用户: ${userList}\n`);
-        } catch (err) {
-            console.error(`发送用户列表失败 ${client.username}:`, err);
-        }
+        sendUserListToClient(clientId);
     }
 }
 
@@ -187,17 +290,34 @@ function sendUserListToClient(clientId: string): void {
     if (!client) return;
     
     const userList = Array.from(clients.values())
-        .map(c => c.username)
-        .join(', ');
+        .map(c => ({
+            username: c.username,
+            online: c.online,
+            isSelf: c.username === client.username
+        }));
     
     try {
-        client.socket.write(`在线用户: ${userList}\n`);
+        client.socket.write(JSON.stringify({
+            type: 'user_list',
+            users: userList,
+            timestamp: new Date().toLocaleTimeString()
+        }) + '\n');
     } catch (err) {
         console.error(`发送用户列表失败 ${client.username}:`, err);
     }
 }
 
 function broadcast(message: string, excludeClientId?: string): void {
+    try {
+        const jsonData = JSON.parse(message);
+        // 如果是私聊消息，不广播
+        if (jsonData.type === 'private') {
+            return;
+        }
+    } catch (error) {
+        // 非JSON消息，正常广播
+    }
+    
     for (const [clientId, client] of clients.entries()) {
         if (clientId !== excludeClientId) {
             try {
@@ -209,6 +329,20 @@ function broadcast(message: string, excludeClientId?: string): void {
     }
 }
 
+// 用户状态广播函数
+function broadcastUserStatus(clientId: string, isOnline: boolean): void {
+    const client = clients.get(clientId);
+    if (!client) return;
+    
+    const statusMessage = JSON.stringify({
+        type: 'user_status',
+        username: client.username,
+        online: isOnline,
+        timestamp: new Date().toLocaleTimeString()
+    });
+    
+    broadcast(statusMessage, clientId);
+}
 // 启动服务器
 server.listen(PORT, () => {
     console.log(`🚀 聊天服务器启动，监听端口 ${PORT}`);
