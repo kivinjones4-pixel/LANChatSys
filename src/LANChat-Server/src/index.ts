@@ -102,22 +102,33 @@ function handleJsonMessage(client: ClientInfo, jsonData: any, clientId: string):
             const fileSize = jsonData.filesize || 0;
             let base64Data = jsonData.filedata || '';
             
-            // 清理Base64数据：移除可能的空格和换行符
+            // **更严格的Base64验证**
+            if (!validateBase64(base64Data)) {
+                console.error(`❌ Base64数据无效: ${fileName}`);
+                
+                // 发送错误消息给客户端
+                const errorMsg = JSON.stringify({
+                    type: 'error',
+                    message: `文件 ${fileName} 数据格式错误`,
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                client.socket.write(errorMsg + '\n');
+                return;
+            }
+            
+            // 清理Base64数据
             base64Data = base64Data.replace(/\s+/g, '');
             
-            // 验证Base64数据是否完整（长度应该是4的倍数）
+            // 确保Base64长度正确
             if (base64Data.length % 4 !== 0) {
-                console.error(`❌ Base64数据不完整: ${fileName}，长度: ${base64Data.length}`);
-                // 可以尝试补全Base64（添加=）
                 const padding = 4 - (base64Data.length % 4);
                 base64Data += '='.repeat(padding);
             }
             
-            // 验证Base64格式
-            const base64Regex = /^[A-Za-z0-9+/]*={0,2}$/;
-            if (!base64Regex.test(base64Data)) {
-                console.error(`❌ Base64格式无效: ${fileName}`);
-                return;
+            // 验证文件大小
+            const decodedSize = Buffer.from(base64Data, 'base64').length;
+            if (fileSize > 0 && decodedSize !== fileSize) {
+                console.warn(`⚠️ 文件大小不匹配: 声明${fileSize}字节，实际${decodedSize}字节`);
             }
             
             // 确保发送者信息存在
@@ -129,14 +140,37 @@ function handleJsonMessage(client: ClientInfo, jsonData: any, clientId: string):
             jsonData.filedata = base64Data;
             
             if (type === 'image_base64') {
-                console.log(`🖼️ ${sender} 发送了图片: ${fileName} (${formatBytes(fileSize)})`);
+                console.log(`🖼️ ${sender} 发送了图片: ${fileName} (${formatBytes(decodedSize)})`);
             } else {
-                console.log(`📁 ${sender} 发送了文件: ${fileName} (${formatBytes(fileSize)})`);
+                console.log(`📁 ${sender} 发送了文件: ${fileName} (${formatBytes(decodedSize)})`);
             }
             
-            // 直接转发JSON数据给所有客户端
+            // **发送前验证JSON**
             try {
-                const jsonString = JSON.stringify(jsonData) + '\n';
+                // 重新构建JSON确保格式正确
+                const cleanJson = {
+                    type: type,
+                    sender: jsonData.sender,
+                    filename: fileName,
+                    filesize: fileSize,
+                    filedata: base64Data,
+                    timestamp: new Date().toLocaleTimeString()
+                };
+                
+                // 如果是私聊文件，添加目标
+                if ((jsonData as any).target) {
+                    (cleanJson as any)['target'] = (jsonData as any).target;
+                }
+                
+                const jsonString = JSON.stringify(cleanJson) + '\n';
+                
+                // 验证JSON长度（避免过大）
+                if (jsonString.length > 10 * 1024 * 1024) { // 10MB限制
+                    console.error(`❌ JSON太大: ${jsonString.length}字节`);
+                    return;
+                }
+                
+                // 广播给所有客户端
                 broadcast(jsonString, clientId);
             } catch (err) {
                 console.error(`❌ JSON序列化失败:`, err);
@@ -328,7 +362,21 @@ function broadcast(message: string, excludeClientId?: string): void {
         }
     }
 }
-
+// 在服务器端添加Base64验证函数
+function validateBase64(base64Data: string): boolean {
+    // 检查是否为有效的Base64
+    if (!base64Data) return false;
+    
+    // 移除空白字符
+    base64Data = base64Data.replace(/\s+/g, '');
+    
+    // Base64长度应该是4的倍数
+    if (base64Data.length % 4 !== 0) return false;
+    
+    // Base64应该只包含合法字符
+    const base64Regex = /^[A-Za-z0-9+/]*={0,2}$/;
+    return base64Regex.test(base64Data);
+}
 // 用户状态广播函数
 function broadcastUserStatus(clientId: string, isOnline: boolean): void {
     const client = clients.get(clientId);

@@ -1562,22 +1562,10 @@ void Widget::sendFile(const QString &filePath)
         return;
     }
 
-    QByteArray fileData = file.readAll();
-    file.close();
-
     QFileInfo fileInfo(filePath);
     QString fileName = fileInfo.fileName();
     qint64 fileSize = fileInfo.size();
     FileType fileType = getFileType(filePath);
-
-    // 使用更安全的Base64编码方式
-    // 将Base64字符串中的换行符和特殊字符移除
-    QString base64Data = fileData.toBase64();
-
-    // 清理Base64字符串中的换行符和特殊字符
-    base64Data = base64Data.replace("\n", "").replace("\r", "");
-    // 对特殊字符进行转义
-    base64Data = base64Data.replace("\\", "\\\\").replace("\"", "\\\"");
 
     // 限制文件大小（例如10MB）
     if (fileSize > 10 * 1024 * 1024) {
@@ -1585,58 +1573,94 @@ void Widget::sendFile(const QString &filePath)
         return;
     }
 
-    // 保存到自己本地的LANChat目录
+    // 读取文件数据
+    QByteArray fileData = file.readAll();
+    file.close();
+
+    // **关键：更安全的Base64编码和清理**
+    QString base64Data = fileData.toBase64();
+
+    // 彻底清理Base64字符串
+    base64Data = base64Data.replace("\n", "");
+    base64Data = base64Data.replace("\r", "");
+    base64Data = base64Data.replace("\"", "\\\"");
+    base64Data = base64Data.replace("\\", "\\\\");
+    base64Data = base64Data.replace("\t", "");
+
+    // **添加Base64完整性检查**
+    if (base64Data.length() % 4 != 0) {
+        // Base64长度必须是4的倍数
+        int padding = 4 - (base64Data.length() % 4);
+        base64Data += QString(padding, '=');
+    }
+
+    // **验证Base64数据**
+    QByteArray testData = QByteArray::fromBase64(base64Data.toUtf8());
+    if (testData.isEmpty() && !fileData.isEmpty()) {
+        QMessageBox::warning(this, "错误", "Base64编码失败，文件可能包含无效字符");
+        return;
+    }
+
+    // 保存到本地
     QString savePath = saveBase64File(fileName, fileData, fileType == Image);
     if (savePath.isEmpty()) {
         QMessageBox::warning(this, "错误", "无法保存文件到本地");
         return;
     }
 
-    // 构建JSON格式的消息
+    // **构建更安全的JSON消息**
     QJsonObject fileJson;
     fileJson["type"] = fileType == Image ? "image_base64" : "file_base64";
     fileJson["sender"] = username;
     fileJson["filename"] = fileName;
     fileJson["filesize"] = QString::number(fileSize);
-    fileJson["filedata"] = base64Data;  // 使用清理后的Base64数据
+    fileJson["filedata"] = base64Data;
 
     // 如果是私聊，添加目标用户
     if (currentChatTarget != "所有人" && currentChatTarget != username) {
         fileJson["target"] = currentChatTarget;
     }
 
+    // 本地显示
     if (fileType == Image) {
         QImage image(filePath);
         if (!image.isNull()) {
-            // 获取图片尺寸信息
             fileJson["width"] = image.width();
             fileJson["height"] = image.height();
-
-            // 显示在聊天窗口
             appendImageMessage(username, image, fileName, savePath, true);
         }
     } else {
-        // 显示文件消息
         appendFileMessage(username, fileName, fileSize, savePath, true);
     }
 
-    // 发送JSON消息 - 确保使用完整格式
+    // **关键：发送前验证JSON**
     QJsonDocument doc(fileJson);
-    // 使用Compact格式但确保数据完整
     QByteArray jsonData = doc.toJson(QJsonDocument::Compact);
 
-    // 添加调试信息
-    qDebug() << "发送文件:" << fileName << "大小:" << fileSize << "Base64长度:" << base64Data.length();
+    // 验证JSON是否有效
+    QJsonParseError parseError;
+    QJsonDocument::fromJson(jsonData, &parseError);
+    if (parseError.error != QJsonParseError::NoError) {
+        qDebug() << "JSON格式错误:" << parseError.errorString();
+        QMessageBox::warning(this, "错误", "消息格式错误，无法发送");
+        return;
+    }
 
-    // 确保以换行符结尾
-    tcpSocket->write(jsonData + "\n");
+    qDebug() << "发送文件:" << fileName << "大小:" << fileSize
+             << "Base64长度:" << base64Data.length()
+             << "JSON长度:" << jsonData.length();
+
+    // 发送JSON数据（确保以换行符结尾）
+    if (tcpSocket->write(jsonData + "\n") == -1) {
+        QMessageBox::warning(this, "发送失败", "网络错误，文件发送失败");
+        return;
+    }
 
     // 显示上传状态
     ui->uploadProgressBar->setVisible(true);
     ui->uploadProgressBar->setValue(100);
     ui->uploadStatusLabel->setText(QString("已上传: %1").arg(fileName));
 
-    // 2秒后隐藏进度条
     QTimer::singleShot(2000, this, [this]() {
         ui->uploadProgressBar->setVisible(false);
         ui->uploadStatusLabel->setText("就绪");
