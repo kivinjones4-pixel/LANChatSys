@@ -247,8 +247,8 @@ void Widget::sendPrivateMessage(const QString &message, const QString &targetUse
     tcpSocket->write(jsonString.toUtf8() + "\n");
 
     // 在本地显示私聊消息
-    QString displayMsg = QString("[私聊] %1").arg(message);
-    appendMessage(username, displayMsg, true);
+    // QString displayMsg = QString("[私聊] %1").arg(message);
+    // appendMessage(username, displayMsg, true);
 
     // 保存到私聊历史
     if (privateChats.contains(targetUser)) {
@@ -434,7 +434,14 @@ void Widget::setupUI()
     QListWidgetItem *defaultItem = new QListWidgetItem("所有人");
     ui->userList->addItem(defaultItem);
     ui->userList->setCurrentItem(defaultItem);
-
+    ui->userList->setStyleSheet(
+        "QListWidget::item:selected {"
+        "    background-color: #4CAF50;"
+        "}"
+        "QListWidget::item:hover {"
+        "    background-color: #A5D6A7;"
+        "}"
+        );
     // 设置用户列表样式
     ui->userList->setAlternatingRowColors(true);
     QFont font = ui->userList->font();
