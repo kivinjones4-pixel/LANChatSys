@@ -1,6 +1,6 @@
 import net, { Socket } from 'net';
 import readline from 'readline';
-
+const fileChunkBuffer: Map<string, Map<number, Buffer>> = new Map();
 const PORT = 8888;
 interface ClientInfo {
     socket: Socket;
@@ -94,7 +94,102 @@ function handleJsonMessage(client: ClientInfo, jsonData: any, clientId: string):
             // 私聊消息
             handlePrivateMessage(client, jsonData, clientId);
             break;
+        // 在handleJsonMessage函数中添加分块处理
+        // 在文件开头添加分块缓存
+
+
+// 在 handleJsonMessage 函数中，完善 file_chunk 处理
+case 'file_chunk': {
+    const fileId = jsonData.file_id;
+    const fileName = jsonData.file_name;
+    const fileSize = parseInt(jsonData.file_size);
+    const totalChunks = jsonData.total_chunks;
+    const chunkIndex = jsonData.chunk_index;
+    let chunkData = jsonData.chunk_data || '';
+    const chunkSize = parseInt(jsonData.chunk_size);
+    
+    console.log(`📦 收到文件分块 ${fileName}: ${chunkIndex + 1}/${totalChunks}`);
+    
+    // 清理Base64数据
+    chunkData = chunkData.replace(/\s+/g, '');
+    
+    // 解码块数据
+    const decodedChunk = Buffer.from(chunkData, 'base64');
+    
+    // 初始化分块缓存
+    if (!fileChunkBuffer.has(fileId)) {
+        fileChunkBuffer.set(fileId, new Map());
+    }
+    
+    const chunkMap = fileChunkBuffer.get(fileId)!;
+    
+    // 存储分块
+    chunkMap.set(chunkIndex, decodedChunk);
+    
+    // 检查是否所有分块都已收到
+    if (chunkMap.size === totalChunks) {
+        console.log(`✅ 文件分块接收完成: ${fileName}`);
+        
+        // 重组文件
+        const chunks: Buffer[] = [];
+        for (let i = 0; i < totalChunks; i++) {
+            const chunk = chunkMap.get(i);
+            if (!chunk) {
+                console.error(`❌ 缺少分块 ${i}`);
+                break;
+            }
+            chunks.push(chunk);
+        }
+        
+        if (chunks.length === totalChunks) {
+            const fullFileData = Buffer.concat(chunks);
             
+            // 创建完整文件消息
+            const completeMessage = {
+                type: 'file_base64', // 或者 image_base64，根据文件类型判断
+                sender: jsonData.sender || client.username,
+                filename: fileName,
+                filesize: fileSize,
+                filedata: fullFileData.toString('base64'),
+                timestamp: new Date().toLocaleTimeString()
+            };
+            
+            // 如果是私聊，添加目标
+            if ((jsonData as any).target) {
+                (completeMessage as any)['target'] = (jsonData as any).target;
+            }
+            
+            // 广播给所有客户端
+            broadcast(JSON.stringify(completeMessage) + '\n', clientId);
+            console.log(`✅ 文件重组完成并广播: ${fileName} (${formatBytes(fullFileData.length)})`);
+        }
+        
+        // 清理缓存
+        fileChunkBuffer.delete(fileId);
+    }
+    
+    // 转发分块给其他客户端
+    const chunkMessage = {
+        type: 'file_chunk',
+        sender: jsonData.sender || client.username,
+        file_id: fileId,
+        file_name: fileName,
+        file_size: fileSize,
+        total_chunks: totalChunks,
+        chunk_index: chunkIndex,
+        chunk_data: chunkData,
+        chunk_size: decodedChunk.length,
+        timestamp: new Date().toLocaleTimeString()
+    };
+    
+    // 如果是私聊，添加目标
+    if ((jsonData as any).target) {
+        (chunkMessage as any)['target'] = (jsonData as any).target;
+    }
+    
+    broadcast(JSON.stringify(chunkMessage) + '\n', clientId);
+    break;
+}
         // 在handleJsonMessage函数中，处理file_base64类型时：
         case 'file_base64':
         case 'image_base64': {

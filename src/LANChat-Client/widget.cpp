@@ -2,6 +2,7 @@
 #include "ui_widget.h"
 #include <QMessageBox>
 #include <QDateTime>
+#include <QThread>
 #include <QHostAddress>
 #include <QInputDialog>
 #include <QSettings>
@@ -14,6 +15,7 @@
 #include <QTimer>
 #include <QIcon>
 #include <QTime>
+#include <QRandomGenerator>
 #include <QMenu>
 #include <QAction>
 #include <QDir>
@@ -884,6 +886,101 @@ void Widget::processJsonMessage(const QJsonObject &jsonObj)
             appendSystemMessage(QString("无法保存文件: %1").arg(fileName));
         }
     }
+    // 在processJsonMessage函数中，修改file_chunk处理部分
+    else if (type == "file_chunk") {
+        QString fileId = jsonObj["file_id"].toString();
+        QString fileName = jsonObj["file_name"].toString();
+        qint64 fileSize = jsonObj["file_size"].toString().toLongLong();
+        int totalChunks = jsonObj["total_chunks"].toInt();
+        int chunkIndex = jsonObj["chunk_index"].toInt();
+        QString chunkDataBase64 = jsonObj["chunk_data"].toString();
+        int chunkSize = jsonObj["chunk_size"].toString().toInt();
+
+        qDebug() << "收到文件分块:" << fileName
+                 << "分块" << chunkIndex + 1 << "/" << totalChunks
+                 << "大小:" << chunkSize << "字节";
+
+        // 清理Base64数据
+        chunkDataBase64 = chunkDataBase64.replace(QRegularExpression("\\s+"), "");
+
+        // 解码块数据
+        QByteArray chunkData = QByteArray::fromBase64(chunkDataBase64.toUtf8());
+
+        if (chunkData.isEmpty()) {
+            qDebug() << "分块解码失败:" << fileName << "分块" << chunkIndex;
+            return;
+        }
+
+        // 检查文件是否已在接收中
+        if (!fileChunkBuffer.contains(fileId)) {
+            // 创建新的文件接收缓冲区
+            FileChunk newFile;
+            newFile.fileName = fileName;
+            newFile.fileId = fileId;
+            newFile.totalChunks = totalChunks;
+            newFile.chunkData = QByteArray();
+            newFile.chunkData.reserve(fileSize); // 预分配空间
+
+            // 如果是私聊，记录目标
+            if (jsonObj.contains("target")) {
+                newFile.targetUser = jsonObj["target"].toString();
+            }
+
+            fileChunkBuffer[fileId] = newFile;
+
+            // 显示接收进度
+            ui->uploadProgressBar->setVisible(true);
+            ui->uploadProgressBar->setRange(0, totalChunks);
+            ui->uploadProgressBar->setValue(0);
+            ui->uploadStatusLabel->setText(QString("接收文件: %1").arg(fileName));
+        }
+
+        FileChunk &file = fileChunkBuffer[fileId];
+
+        // 存储块数据（追加到末尾）
+        file.chunkData.append(chunkData);
+
+        // 更新进度
+        int receivedChunks = file.chunkData.size() / (fileSize / totalChunks + 1);
+        ui->uploadProgressBar->setValue(receivedChunks);
+        ui->uploadStatusLabel->setText(QString("接收中: %1 (%2/%3)")
+                                           .arg(fileName)
+                                           .arg(receivedChunks)
+                                           .arg(totalChunks));
+
+        // 检查是否所有块都已接收
+        if (chunkIndex == totalChunks - 1 || file.chunkData.size() >= fileSize) {
+            qDebug() << "文件接收完成:" << fileName
+                     << "大小:" << file.chunkData.size() << "字节";
+
+            // 保存文件
+            QString savePath = saveBase64File(fileName, file.chunkData, false);
+
+            if (!savePath.isEmpty()) {
+                // 判断是否为图片
+                QImage image;
+                bool isImage = image.loadFromData(file.chunkData);
+
+                if (isImage) {
+                    appendImageMessage(sender, image, fileName, savePath, sender == username);
+                } else {
+                    appendFileMessage(sender, fileName, file.chunkData.size(), savePath, sender == username);
+                }
+
+                ui->uploadStatusLabel->setText(QString("已接收: %1").arg(fileName));
+            } else {
+                appendSystemMessage(QString("无法保存文件: %1").arg(fileName));
+            }
+
+            // 清理缓冲区
+            fileChunkBuffer.remove(fileId);
+
+            QTimer::singleShot(2000, this, [this]() {
+                ui->uploadProgressBar->setVisible(false);
+                ui->uploadStatusLabel->setText("就绪");
+            });
+        }
+    }
 }
 // 更新用户状态
 void Widget::updateUserListWithStatus(const QString &user, bool online)
@@ -1565,106 +1662,127 @@ void Widget::sendFile(const QString &filePath)
     QFileInfo fileInfo(filePath);
     QString fileName = fileInfo.fileName();
     qint64 fileSize = fileInfo.size();
-    FileType fileType = getFileType(filePath);
 
-    // 限制文件大小（例如10MB）
-    if (fileSize > 10 * 1024 * 1024) {
-        QMessageBox::warning(this, "文件太大", "文件大小超过10MB限制");
-        return;
+    // 判断是否为图片
+    bool isImage = false;
+    QStringList imageExtensions = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"};
+    for (const QString &ext : imageExtensions) {
+        if (fileName.toLower().endsWith(ext)) {
+            isImage = true;
+            break;
+        }
     }
 
-    // 读取文件数据
-    QByteArray fileData = file.readAll();
-    file.close();
+    // 计算分块数量（每块50KB）
+    const qint64 CHUNK_SIZE = 50 * 1024;
+    int totalChunks = std::ceil((double)fileSize / CHUNK_SIZE);
 
-    // **关键：更安全的Base64编码和清理**
-    QString base64Data = fileData.toBase64();
+    // 生成唯一文件ID
+    QString fileId = QString("%1_%2")
+                         .arg(QDateTime::currentMSecsSinceEpoch())
+                         .arg(QRandomGenerator::global()->generate());
 
-    // 彻底清理Base64字符串
-    base64Data = base64Data.replace("\n", "");
-    base64Data = base64Data.replace("\r", "");
-    base64Data = base64Data.replace("\"", "\\\"");
-    base64Data = base64Data.replace("\\", "\\\\");
-    base64Data = base64Data.replace("\t", "");
+    // 显示上传进度
+    ui->uploadProgressBar->setVisible(true);
+    ui->uploadProgressBar->setRange(0, totalChunks);
+    ui->uploadProgressBar->setValue(0);
+    ui->uploadStatusLabel->setText(QString("上传中: %1 (0/%2)").arg(fileName).arg(totalChunks));
 
-    // **添加Base64完整性检查**
-    if (base64Data.length() % 4 != 0) {
-        // Base64长度必须是4的倍数
-        int padding = 4 - (base64Data.length() % 4);
-        base64Data += QString(padding, '=');
-    }
+    // 是否为私聊
+    bool isPrivate = currentChatTarget != "所有人" && currentChatTarget != username;
 
-    // **验证Base64数据**
-    QByteArray testData = QByteArray::fromBase64(base64Data.toUtf8());
-    if (testData.isEmpty() && !fileData.isEmpty()) {
-        QMessageBox::warning(this, "错误", "Base64编码失败，文件可能包含无效字符");
-        return;
-    }
-
-    // 保存到本地
-    QString savePath = saveBase64File(fileName, fileData, fileType == Image);
-    if (savePath.isEmpty()) {
-        QMessageBox::warning(this, "错误", "无法保存文件到本地");
-        return;
-    }
-
-    // **构建更安全的JSON消息**
-    QJsonObject fileJson;
-    fileJson["type"] = fileType == Image ? "image_base64" : "file_base64";
-    fileJson["sender"] = username;
-    fileJson["filename"] = fileName;
-    fileJson["filesize"] = QString::number(fileSize);
-    fileJson["filedata"] = base64Data;
-
-    // 如果是私聊，添加目标用户
-    if (currentChatTarget != "所有人" && currentChatTarget != username) {
-        fileJson["target"] = currentChatTarget;
-    }
-
-    // 本地显示
-    if (fileType == Image) {
+    // 本地先显示文件消息（预览）
+    QString savePath = saveBase64File(fileName, QByteArray(), false); // 先保存一个空文件
+    if (isImage) {
         QImage image(filePath);
         if (!image.isNull()) {
-            fileJson["width"] = image.width();
-            fileJson["height"] = image.height();
             appendImageMessage(username, image, fileName, savePath, true);
         }
     } else {
         appendFileMessage(username, fileName, fileSize, savePath, true);
     }
 
-    // **关键：发送前验证JSON**
-    QJsonDocument doc(fileJson);
-    QByteArray jsonData = doc.toJson(QJsonDocument::Compact);
+    // 发送分块
+    int successfulChunks = 0;
+    for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        // 读取块数据
+        qint64 readSize = qMin(CHUNK_SIZE, fileSize - chunkIndex * CHUNK_SIZE);
+        QByteArray chunkData = file.read(readSize);
 
-    // 验证JSON是否有效
-    QJsonParseError parseError;
-    QJsonDocument::fromJson(jsonData, &parseError);
-    if (parseError.error != QJsonParseError::NoError) {
-        qDebug() << "JSON格式错误:" << parseError.errorString();
-        QMessageBox::warning(this, "错误", "消息格式错误，无法发送");
-        return;
+        if (chunkData.isEmpty()) {
+            qDebug() << "读取文件块失败";
+            break;
+        }
+
+        // Base64编码
+        QString base64Data = chunkData.toBase64();
+
+        // 清理Base64数据
+        base64Data = base64Data.replace("\n", "").replace("\r", "");
+
+        // 构建分块消息
+        QJsonObject chunkJson;
+        chunkJson["type"] = "file_chunk";
+        chunkJson["sender"] = username;
+        chunkJson["file_id"] = fileId;
+        chunkJson["file_name"] = fileName;
+        chunkJson["file_size"] = QString::number(fileSize);
+        chunkJson["total_chunks"] = totalChunks;
+        chunkJson["chunk_index"] = chunkIndex;
+        chunkJson["chunk_data"] = base64Data;
+        chunkJson["chunk_size"] = QString::number(chunkData.size());
+
+        // 如果是私聊，添加目标
+        if (isPrivate) {
+            chunkJson["target"] = currentChatTarget;
+        }
+
+        QJsonDocument doc(chunkJson);
+        QByteArray jsonData = doc.toJson(QJsonDocument::Compact) + "\n";
+
+        // 发送分块
+        qint64 bytesWritten = tcpSocket->write(jsonData);
+        if (bytesWritten == -1) {
+            qDebug() << "发送文件块失败";
+            break;
+        }
+
+        successfulChunks++;
+
+        // 更新进度
+        ui->uploadProgressBar->setValue(successfulChunks);
+        ui->uploadStatusLabel->setText(QString("上传中: %1 (%2/%3)")
+                                           .arg(fileName)
+                                           .arg(successfulChunks)
+                                           .arg(totalChunks));
+
+        // 确保数据发送
+        if (!tcpSocket->waitForBytesWritten(1000)) {
+            qDebug() << "等待写入超时";
+        }
+
+        // 小延迟避免网络拥塞
+        QThread::msleep(5);
+        QCoreApplication::processEvents();
     }
 
-    qDebug() << "发送文件:" << fileName << "大小:" << fileSize
-             << "Base64长度:" << base64Data.length()
-             << "JSON长度:" << jsonData.length();
+    file.close();
 
-    // 发送JSON数据（确保以换行符结尾）
-    if (tcpSocket->write(jsonData + "\n") == -1) {
-        QMessageBox::warning(this, "发送失败", "网络错误，文件发送失败");
-        return;
+    if (successfulChunks == totalChunks) {
+        // 显示上传完成
+        ui->uploadStatusLabel->setText(QString("已上传: %1").arg(fileName));
+
+        QTimer::singleShot(2000, this, [this]() {
+            ui->uploadProgressBar->setVisible(false);
+            ui->uploadStatusLabel->setText("就绪");
+        });
+    } else {
+        ui->uploadStatusLabel->setText(QString("上传失败: %1 (%2/%3)")
+                                           .arg(fileName)
+                                           .arg(successfulChunks)
+                                           .arg(totalChunks));
+        appendSystemMessage(QString("文件 %1 上传失败").arg(fileName));
     }
-
-    // 显示上传状态
-    ui->uploadProgressBar->setVisible(true);
-    ui->uploadProgressBar->setValue(100);
-    ui->uploadStatusLabel->setText(QString("已上传: %1").arg(fileName));
-
-    QTimer::singleShot(2000, this, [this]() {
-        ui->uploadProgressBar->setVisible(false);
-        ui->uploadStatusLabel->setText("就绪");
-    });
 }
 void Widget::sendMessage(const QString &message)
 {

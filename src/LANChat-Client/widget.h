@@ -110,6 +110,16 @@ private:
     qint64 totalFileSize;           // 当前接收文件的总大小
     QString receivedFileName;       // 当前接收的文件名
     FileType receivedFileType;      // 当前接收的文件类型
+    struct FileChunk {
+        QString fileName;
+        QString fileId;  // 唯一文件标识
+        int totalChunks;
+        int currentChunk;
+        QByteArray chunkData;
+        QString targetUser;  // 私聊目标
+    };
+
+    QMap<QString, FileChunk> fileChunkBuffer;  // fileId -> 正在接收的文件
 
     // 私聊相关
     struct PrivateChat {

@@ -6,7 +6,7 @@ import time
 import sys
 
 class SimpleChatClient:
-    def __init__(self, host='127.0.0.1', port=8888, username='TestUser'):
+    def __init__(self, host='123.60.222.229', port=8888, username='TestUser'):
         self.host = host
         self.port = port
         self.username = username
